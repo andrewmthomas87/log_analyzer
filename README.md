@@ -13,7 +13,11 @@ uv venv && uv pip install -e .
 ## Usage
 
 ```sh
+# Basic log summary (duration, entries, record count)
 log-analyzer summary path/to/robot.wpilog
+
+# Cycle time analysis by robot mode (disabled, auto, teleop, test)
+log-analyzer timings path/to/robot.wpilog
 ```
 
 ## The .wpilog format
