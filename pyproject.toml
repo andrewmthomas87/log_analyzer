@@ -1,0 +1,18 @@
+[project]
+name = "log-analyzer"
+version = "0.1.0"
+description = "CLI tool for analyzing FRC robot .wpilog files"
+requires-python = ">=3.11"
+dependencies = [
+    "click>=8.0",
+]
+
+[project.scripts]
+log-analyzer = "log_analyzer.cli:cli"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/log_analyzer"]
