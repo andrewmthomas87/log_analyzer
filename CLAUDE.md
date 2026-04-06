@@ -30,7 +30,7 @@ Data flows one way: `cli.py` → `stats.py` → `reader.py`. The reader knows no
 
 ## .wpilog format notes
 
-AdvantageKit entry names use slash-delimited paths. Real robot outputs live under `/RealOutputs/` (not bare names like `LoggedRobot/...`). See the README for a fuller format reference.
+AdvantageKit entry names use slash-delimited paths. **User-code outputs** live under `/RealOutputs/` (e.g. `/RealOutputs/LoggedRobot/FullCycleMS`). **Hardware inputs** live at their own top-level prefixes — `/PowerDistribution/`, `/SystemStats/`, `/DriverStation/` — and are *not* nested under `/RealOutputs/`. When adding an analysis for a new value, don't assume the prefix; check an actual log with `log-analyzer summary` first. See the README for a fuller format reference.
 
 ## Testing
 

@@ -18,6 +18,10 @@ log-analyzer summary path/to/robot.wpilog
 
 # Cycle time analysis by robot mode (disabled, auto, teleop, test)
 log-analyzer timings path/to/robot.wpilog
+
+# Power usage: voltage, current by channel/mode, brownouts, breaker trip risk
+log-analyzer power path/to/robot.wpilog \
+    [--breaker-rating 40] [--main-breaker-rating 120]
 ```
 
 ## The .wpilog format
@@ -35,12 +39,18 @@ AdvantageKit logs all robot state every 20ms cycle. Entry names use slash-delimi
 
 | Prefix | Contents |
 |---|---|
-| `/RealOutputs/` | Output values from real robot execution |
+| `/RealOutputs/` | Output values computed by user code on the real robot |
 | `/ReplayOutputs/` | Output values from log replay simulation |
 | `/DriverStation/` | Driver station and controller data |
-| `/SystemStats/` | Battery voltage, CAN status, etc. |
+| `/SystemStats/` | roboRIO system info: `BatteryVoltage`, `BrownedOut`, `CANBus`, etc. |
+| `/PowerDistribution/` | PDH/PDP readings: `Voltage`, `TotalCurrent`, `ChannelCurrent[]` |
 
-Timing data lives at `/RealOutputs/LoggedRobot/FullCycleMS`, `/RealOutputs/LoggedRobot/UserCodeMs`, etc.
+**Inputs vs. outputs.** Hardware inputs (things the robot *reads* — PDH, DriverStation, SystemStats) live at their own top-level prefixes, **not** under `/RealOutputs/`. Only values the user code publishes get the `/RealOutputs/` prefix. When wiring a new analysis, check an actual log with `log-analyzer summary` to find the exact key path rather than guessing.
+
+Examples:
+- Cycle time: `/RealOutputs/LoggedRobot/FullCycleMS` (user-code output)
+- Per-channel current: `/PowerDistribution/ChannelCurrent` (hardware input)
+- Brownout flag: `/SystemStats/BrownedOut` (hardware input)
 
 ### Parser
 
