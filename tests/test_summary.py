@@ -1,10 +1,10 @@
-"""Smoke test: build a minimal .wpilog in memory and verify summary parsing."""
+"""Tests: build minimal .wpilog binaries in memory and verify parsing."""
 
 import struct
 from pathlib import Path
 
 from log_analyzer.reader import DataLogReader
-from log_analyzer.stats import summarize
+from log_analyzer.stats import summarize, analyze_cycle_times
 
 
 def _write_record(buf: bytearray, entry: int, timestamp: int, payload: bytes):
@@ -66,7 +66,7 @@ def test_reader_validates_header():
     assert not reader.is_valid()
 
 
-def test_summary_with_cycle_times(tmp_path: Path):
+def test_summary_basic(tmp_path: Path):
     cycle_times = [15.0, 18.0, 22.0, 16.0, 19.0, 25.0, 17.0, 14.0, 20.0, 21.0]
     log_bytes = build_test_wpilog(cycle_times)
 
@@ -78,9 +78,19 @@ def test_summary_with_cycle_times(tmp_path: Path):
     assert result.num_entries == 1
     assert result.num_data_records == 10
     assert result.duration_secs > 0
-    assert result.has_cycle_times
 
-    stats = result.cycle_time_stats
+
+def test_cycle_times(tmp_path: Path):
+    cycle_times = [15.0, 18.0, 22.0, 16.0, 19.0, 25.0, 17.0, 14.0, 20.0, 21.0]
+    log_bytes = build_test_wpilog(cycle_times)
+
+    log_path = tmp_path / "test.wpilog"
+    log_path.write_bytes(log_bytes)
+
+    report = analyze_cycle_times(log_path)
+
+    assert report.has_data
+    stats = report.stats
     assert stats is not None
     assert stats["min"] == 14.0
     assert stats["max"] == 25.0

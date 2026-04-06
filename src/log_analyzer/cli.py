@@ -2,7 +2,7 @@ from pathlib import Path
 
 import click
 
-from .stats import CYCLE_TIME_KEY, summarize
+from .stats import CYCLE_TIME_KEY, analyze_cycle_times, summarize
 
 
 @click.group()
@@ -29,9 +29,18 @@ def summary(logfile: Path):
     for entry in sorted(result.entries, key=lambda e: e.name):
         click.echo(f"  {entry.name} ({entry.type})")
 
-    stats = result.cycle_time_stats
+
+@cli.command()
+@click.argument("logfile", type=click.Path(exists=True, path_type=Path))
+def timings(logfile: Path):
+    """Analyze cycle times from a .wpilog file."""
+    try:
+        report = analyze_cycle_times(logfile)
+    except ValueError as e:
+        raise click.ClickException(str(e))
+
+    stats = report.stats
     if stats:
-        click.echo()
         click.echo(f"Cycle times ({CYCLE_TIME_KEY}):")
         click.echo(f"  samples:  {stats['count']:,}")
         click.echo(f"  min:      {stats['min']:.2f} ms")
@@ -41,9 +50,8 @@ def summary(logfile: Path):
         click.echo(f"  max:      {stats['max']:.2f} ms")
         if stats["max"] > 20.0:
             click.secho(
-                f"  ⚠ {sum(1 for v in result.cycle_time_ms if v > 20.0)} cycles exceeded 20ms",
+                f"  ⚠ {sum(1 for v in report.values_ms if v > 20.0)} cycles exceeded 20ms",
                 fg="yellow",
             )
     else:
-        click.echo()
         click.echo(f"No cycle time data found (looked for {CYCLE_TIME_KEY})")
