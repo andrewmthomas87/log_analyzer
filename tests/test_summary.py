@@ -38,22 +38,55 @@ def _make_start_payload(entry_id: int, name: str, type_str: str, metadata: str =
     return bytes(payload)
 
 
-def build_test_wpilog(cycle_times: list[float]) -> bytes:
-    """Create a minimal .wpilog with cycle time data."""
-    buf = bytearray()
-    # Header
+# Entry IDs used across test helpers
+_CYCLE_ENTRY = 1
+_DS_ENABLED_ENTRY = 2
+_DS_AUTONOMOUS_ENTRY = 3
+_DS_TEST_ENTRY = 4
+
+
+def _write_wpilog_header(buf: bytearray):
+    """Write the .wpilog file header."""
     buf.extend(b"WPILOG")
     buf.extend((0x0100).to_bytes(2, "little"))  # version 1.0
     buf.extend((0).to_bytes(4, "little"))  # no extra header
 
-    # Start record for cycle times (entry ID 1)
-    start_payload = _make_start_payload(1, "/RealOutputs/LoggedRobot/FullCycleMS", "double")
-    _write_record(buf, 0, 0, start_payload)
 
-    # Data records
+def _write_start_records(buf: bytearray, include_ds: bool = False):
+    """Write Start control records for cycle time and optionally DriverStation entries."""
+    _write_record(buf, 0, 0, _make_start_payload(
+        _CYCLE_ENTRY, "/RealOutputs/LoggedRobot/FullCycleMS", "double"))
+    if include_ds:
+        _write_record(buf, 0, 0, _make_start_payload(
+            _DS_ENABLED_ENTRY, "/DriverStation/Enabled", "boolean"))
+        _write_record(buf, 0, 0, _make_start_payload(
+            _DS_AUTONOMOUS_ENTRY, "/DriverStation/Autonomous", "boolean"))
+        _write_record(buf, 0, 0, _make_start_payload(
+            _DS_TEST_ENTRY, "/DriverStation/Test", "boolean"))
+
+
+def _write_ds_state(buf: bytearray, timestamp: int,
+                    enabled: bool, autonomous: bool = False, test: bool = False):
+    """Write DriverStation boolean records at the given timestamp."""
+    _write_record(buf, _DS_ENABLED_ENTRY, timestamp, struct.pack("?", enabled))
+    _write_record(buf, _DS_AUTONOMOUS_ENTRY, timestamp, struct.pack("?", autonomous))
+    _write_record(buf, _DS_TEST_ENTRY, timestamp, struct.pack("?", test))
+
+
+def _write_cycle_time(buf: bytearray, timestamp: int, value: float):
+    """Write a single cycle time data record."""
+    _write_record(buf, _CYCLE_ENTRY, timestamp, struct.pack("<d", value))
+
+
+def build_test_wpilog(cycle_times: list[float]) -> bytes:
+    """Create a minimal .wpilog with cycle time data (no DriverStation entries)."""
+    buf = bytearray()
+    _write_wpilog_header(buf)
+    _write_start_records(buf, include_ds=False)
+
     for i, val in enumerate(cycle_times):
         timestamp = (i + 1) * 20_000  # 20ms apart, in microseconds
-        _write_record(buf, 1, timestamp, struct.pack("<d", val))
+        _write_cycle_time(buf, timestamp, val)
 
     return bytes(buf)
 
@@ -88,10 +121,103 @@ def test_cycle_times(tmp_path: Path):
     log_path.write_bytes(log_bytes)
 
     report = analyze_cycle_times(log_path)
+    ct = report.cycle_times
 
     assert report.has_data
-    stats = report.stats
+    stats = ct.stats()
     assert stats is not None
     assert stats["min"] == 14.0
     assert stats["max"] == 25.0
     assert stats["count"] == 10
+    # Without DriverStation entries, all cycles land in disabled
+    assert len(ct.disabled) == 10
+    assert len(ct.enabled) == 0
+
+
+def test_cycle_times_by_mode(tmp_path: Path):
+    """Simulate a log with disabled -> auto -> teleop -> disabled periods."""
+    buf = bytearray()
+    _write_wpilog_header(buf)
+    _write_start_records(buf, include_ds=True)
+
+    t = 1_000  # start timestamp in microseconds
+
+    # Period 1: disabled (2 cycles)
+    _write_ds_state(buf, t, enabled=False)
+    _write_cycle_time(buf, t + 1_000, 10.0)
+    _write_cycle_time(buf, t + 2_000, 11.0)
+
+    # Period 2: autonomous (3 cycles)
+    t = 100_000
+    _write_ds_state(buf, t, enabled=True, autonomous=True)
+    _write_cycle_time(buf, t + 1_000, 15.0)
+    _write_cycle_time(buf, t + 2_000, 16.0)
+    _write_cycle_time(buf, t + 3_000, 17.0)
+
+    # Period 3: teleop (4 cycles)
+    t = 200_000
+    _write_ds_state(buf, t, enabled=True, autonomous=False)
+    _write_cycle_time(buf, t + 1_000, 18.0)
+    _write_cycle_time(buf, t + 2_000, 19.0)
+    _write_cycle_time(buf, t + 3_000, 22.0)
+    _write_cycle_time(buf, t + 4_000, 20.0)
+
+    # Period 4: disabled again (1 cycle)
+    t = 300_000
+    _write_ds_state(buf, t, enabled=False)
+    _write_cycle_time(buf, t + 1_000, 12.0)
+
+    log_path = tmp_path / "test.wpilog"
+    log_path.write_bytes(bytes(buf))
+
+    report = analyze_cycle_times(log_path)
+    ct = report.cycle_times
+
+    assert ct.stats()["count"] == 10
+
+    # Disabled: 10, 11, 12
+    assert len(ct.disabled) == 3
+    assert ct.stats("disabled")["min"] == 10.0
+    assert ct.stats("disabled")["max"] == 12.0
+
+    # Enabled: auto + teleop = 7
+    assert len(ct.enabled) == 7
+    assert ct.stats("enabled")["count"] == 7
+    assert ct.stats("enabled")["min"] == 15.0
+
+    # Autonomous: 15, 16, 17
+    assert len(ct.autonomous) == 3
+    assert ct.stats("autonomous")["min"] == 15.0
+    assert ct.stats("autonomous")["max"] == 17.0
+
+    # Teleop: 18, 19, 22, 20
+    assert len(ct.teleop) == 4
+    assert ct.stats("teleop")["min"] == 18.0
+    assert ct.stats("teleop")["max"] == 22.0
+
+    # Test: none
+    assert len(ct.test) == 0
+    assert ct.stats("test") is None
+
+
+def test_cycle_times_with_test_mode(tmp_path: Path):
+    """Verify test mode is bucketed separately from teleop."""
+    buf = bytearray()
+    _write_wpilog_header(buf)
+    _write_start_records(buf, include_ds=True)
+
+    t = 1_000
+    _write_ds_state(buf, t, enabled=True, test=True)
+    _write_cycle_time(buf, t + 1_000, 13.0)
+    _write_cycle_time(buf, t + 2_000, 14.0)
+
+    log_path = tmp_path / "test.wpilog"
+    log_path.write_bytes(bytes(buf))
+
+    report = analyze_cycle_times(log_path)
+    ct = report.cycle_times
+
+    assert len(ct.test) == 2
+    assert len(ct.teleop) == 0
+    assert len(ct.autonomous) == 0
+    assert len(ct.enabled) == 2
