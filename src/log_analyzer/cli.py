@@ -5,8 +5,11 @@ import click
 from .stats import (
     CYCLE_TIME_KEY,
     ByMode,
+    SignalCorrelation,
     _compute_stats,
+    analyze_brownout_correlation,
     analyze_cycle_times,
+    analyze_mechanisms,
     analyze_power,
     summarize,
 )
@@ -353,3 +356,194 @@ def power(logfile: Path, breaker_rating: float, main_breaker_rating: float):
     click.echo("      otherwise integrate fake heat across the gap. As a side effect,")
     click.echo("      the \"Time over rating\" column is a lower bound on wall-clock")
     click.echo("      time — we can't know what happened inside a gap.")
+
+
+# --- Mechanisms command ---
+
+
+@cli.command()
+@click.argument("logfile", type=click.Path(exists=True, path_type=Path))
+def mechanisms(logfile: Path):
+    """Analyze mechanism motor stats from a .wpilog file."""
+    try:
+        reports = analyze_mechanisms(logfile)
+    except ValueError as e:
+        raise click.ClickException(str(e))
+
+    active = [r for r in reports if r.has_data]
+    if not active:
+        click.echo("No mechanism data found.")
+        return
+
+    for report in active:
+        _section(report.name.upper())
+        _print_stats_header()
+
+        if report.current.overall:
+            _print_by_mode_block("Cur(A)", report.current)
+
+        if report.voltage.overall:
+            click.echo()
+            _print_by_mode_block("Vol(V)", report.voltage)
+
+        if report.temperature.overall:
+            click.echo()
+            _print_by_mode_block("Tmp(C)", report.temperature)
+
+        if report.velocity.overall:
+            click.echo()
+            vel_label = "V(r/s)" if report.vel_unit == "rad/s" else "V(RPS)"
+            _print_by_mode_block(vel_label, report.velocity)
+
+        if report.energy_wh > 0:
+            click.echo()
+            motor_note = " (4 motors summed)" if report.name in ("Drive Motors", "Steer Motors") else ""
+            click.echo(f"  Energy: {report.energy_wh:.4f} Wh{motor_note}")
+
+    _section("NOTES")
+    click.echo("  Each row is one robot mode. Modes with no samples are omitted.")
+    click.echo()
+    click.echo("  Label column key:")
+    click.echo("    Cur(A)   — stator current (amps)")
+    click.echo("    Vol(V)   — applied motor voltage (volts; signed: negative = reverse)")
+    click.echo("    Tmp(C)   — motor temperature (°C)")
+    click.echo("    V(RPS)   — velocity in rotations per second")
+    click.echo("    V(r/s)   — velocity in radians per second (drive/steer modules)")
+    click.echo()
+    click.echo("  Energy (Wh):")
+    click.echo("    Integrated max(0, V × I) per motor, summed across the log.")
+    click.echo("    Only counts power drawn from the battery; regenerative braking")
+    click.echo("    intervals (negative V × I) contribute 0.")
+    click.echo("    Uses the last-known voltage at each current sample.")
+    click.echo("    dt is capped at 100 ms per step to avoid inflating energy across")
+    click.echo("    log gaps. For grouped mechanisms (Drive/Steer) the total covers")
+    click.echo("    all 4 motors combined.")
+
+
+# --- Brownout correlate command ---
+
+
+def _corr_header():
+    click.echo(
+        f"  {'State':<10}  {'Samples':>8}  "
+        f"{'Min':>8} {'Mean':>8} {'Median':>8} {'P95':>8} {'Max':>8}  {'ΔMean%':>8}"
+    )
+    click.echo("  " + "-" * 76)
+
+
+def _corr_rows(corr: SignalCorrelation, brownout_event_count: int):
+    ns = corr.normal_stats()
+    bs = corr.brownout_stats()
+    delta = corr.mean_delta_pct()
+    delta_str = f"{delta:+.0f}%" if delta is not None else ""
+
+    if ns:
+        click.echo(
+            f"  {'normal':<10}  {int(ns['count']):>8,}  "
+            f"{ns['min']:>8.2f} {ns['mean']:>8.2f} {ns['median']:>8.2f} "
+            f"{ns['p95']:>8.2f} {ns['max']:>8.2f}"
+        )
+    if bs:
+        line = (
+            f"  {'brownout':<10}  {int(bs['count']):>8,}  "
+            f"{bs['min']:>8.2f} {bs['mean']:>8.2f} {bs['median']:>8.2f} "
+            f"{bs['p95']:>8.2f} {bs['max']:>8.2f}  {delta_str:>8}"
+        )
+        if delta is not None and abs(delta) >= 100:
+            click.secho(line, fg="red")
+        elif delta is not None and abs(delta) >= 50:
+            click.secho(line, fg="yellow")
+        else:
+            click.echo(line)
+    elif brownout_event_count > 0:
+        click.echo(f"  {'brownout':<10}  {'(no samples)':>8}")
+
+
+@cli.command("brownout-correlate")
+@click.argument("logfile", type=click.Path(exists=True, path_type=Path))
+def brownout_correlate(logfile: Path):
+    """Correlate mechanism and PDH signals against brownout events."""
+    try:
+        report = analyze_brownout_correlation(logfile)
+    except ValueError as e:
+        raise click.ClickException(str(e))
+
+    n = report.brownout_event_count
+    if n == 0:
+        click.echo("No brownout events detected in this log.")
+        if report.has_data:
+            click.echo("(Signal data was found; use 'mechanisms' or 'power' for general analysis.)")
+        return
+
+    click.secho(f"{n} brownout event(s) detected.", bold=True)
+
+    if report.voltage.normal or report.voltage.brownout:
+        _section("VOLTAGE  (volts)")
+        _corr_header()
+        _corr_rows(report.voltage, n)
+
+    if report.total_current.normal or report.total_current.brownout:
+        _section("TOTAL CURRENT  (amps)")
+        _corr_header()
+        _corr_rows(report.total_current, n)
+
+    if report.channel_correlations:
+        _section("PDH CHANNELS  (amps, ranked by brownout mean)")
+        click.echo(
+            f"  {'Ch':<5}  {'Norm mean':>10}  {'Norm max':>9}  "
+            f"{'BO mean':>8}  {'BO max':>8}  {'BO samps':>9}  {'ΔMean%':>8}"
+        )
+        click.echo("  " + "-" * 72)
+        for ch, corr in report.channel_correlations:
+            ns = corr.normal_stats()
+            bs = corr.brownout_stats()
+            delta = corr.mean_delta_pct()
+            delta_str = f"{delta:+.0f}%" if delta is not None else "n/a"
+            nm = f"{ns['mean']:>10.2f}" if ns else f"{'—':>10}"
+            nx = f"{ns['max']:>9.2f}" if ns else f"{'—':>9}"
+            bm = f"{bs['mean']:>8.2f}" if bs else f"{'—':>8}"
+            bx = f"{bs['max']:>8.2f}" if bs else f"{'—':>8}"
+            bc = f"{int(bs['count']):>9,}" if bs else f"{'—':>9}"
+            line = f"  {ch:<5}  {nm}  {nx}  {bm}  {bx}  {bc}  {delta_str:>8}"
+            if delta is not None and abs(delta) >= 100:
+                click.secho(line, fg="red")
+            elif delta is not None and abs(delta) >= 50:
+                click.secho(line, fg="yellow")
+            else:
+                click.echo(line)
+
+    active_mechs = [m for m in report.mechanisms if m.has_data]
+    if active_mechs:
+        _section("MECHANISMS  (sorted by brownout current mean, desc)")
+        for mech in active_mechs:
+            click.echo()
+            click.secho(f"  {mech.name}", bold=True)
+            _corr_header()
+            signals = [
+                ("Current(A)", mech.current),
+                ("Voltage(V)", mech.voltage),
+                ("Temp(C)", mech.temperature),
+                (f"Vel({'r/s' if mech.vel_unit == 'rad/s' else 'RPS'})", mech.velocity),
+            ]
+            for label, corr in signals:
+                if corr.normal or corr.brownout:
+                    click.echo(f"  {label}")
+                    _corr_rows(corr, n)
+
+    _section("NOTES")
+    click.echo("  ΔMean% = (brownout mean − normal mean) / |normal mean| × 100.")
+    click.echo("  A large positive ΔMean% on current means the mechanism drew")
+    click.echo("  significantly more during brownout conditions.")
+    click.echo()
+    click.echo("  Causality is not guaranteed: a mechanism may be elevated *because*")
+    click.echo("  another load caused the brownout, not because it caused it. Use")
+    click.echo("  the 'power' command's brownout timestamps to inspect what was")
+    click.echo("  happening in the seconds leading up to each event.")
+    click.echo()
+    click.echo("  Color coding on ΔMean%:")
+    click.echo("    yellow — meaningfully elevated (|ΔMean%| ≥ 50%)")
+    click.echo("    red    — strongly elevated (|ΔMean%| ≥ 100%)")
+    click.echo()
+    click.echo("  Mechanisms sorted by brownout-period current mean (highest first).")
+    click.echo("  PDH channels sorted by brownout-period mean current (highest first).")
+    click.echo("  Mechanisms with no data in this log are omitted.")

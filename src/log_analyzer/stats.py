@@ -3,6 +3,7 @@ import statistics
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+from typing import NamedTuple
 
 from .reader import DataLogReader, StartRecordData
 
@@ -426,6 +427,457 @@ class _BreakerSimulator:
         return False
 
 
+
+
+# --- Mechanism analysis ---
+
+_MECH_DT_MAX = 0.1  # same dt cap as breaker sim; prevents runaway integration across log gaps
+
+
+class _MechMotor(NamedTuple):
+    report_name: str
+    current_key: str
+    voltage_key: str
+    temp_key: str | None
+    vel_key: str | None
+    vel_unit: str = "RPS"
+
+
+_MOTORS: list[_MechMotor] = [
+    _MechMotor(
+        "Collector Pivot",
+        "/Collector/PivotCurrentAmps",
+        "/Collector/PivotVoltageVolts",
+        "/Collector/PivotTemperatureCelsius",
+        "/Collector/PivotVelocityRPS",
+    ),
+    _MechMotor(
+        "Collector Rollers",
+        "/Collector/RollersCurrentAmps",
+        "/Collector/RollersVoltageVolts",
+        "/Collector/RollersTemperatureCelsius",
+        "/Collector/RollersVelocityRPS",
+    ),
+    _MechMotor(
+        "Flywheel L",
+        "/Flywheel LEFT/CurrentAmps",
+        "/Flywheel LEFT/VoltageVolts",
+        "/Flywheel LEFT/TemperatureCelsius",
+        "/Flywheel LEFT/VelocityRPS",
+    ),
+    _MechMotor(
+        "Flywheel R",
+        "/Flywheel RIGHT/CurrentAmps",
+        "/Flywheel RIGHT/VoltageVolts",
+        "/Flywheel RIGHT/TemperatureCelsius",
+        "/Flywheel RIGHT/VelocityRPS",
+    ),
+    _MechMotor(
+        "Tower",
+        "/Tower/CurrentAmps",
+        "/Tower/VoltageVolts",
+        "/Tower/TemperatureCelsius",
+        "/Tower/VelocityRPS",
+    ),
+    _MechMotor(
+        "Twindexer",
+        "/Twindexer/CurrentAmps",
+        "/Twindexer/VoltageVolts",
+        "/Twindexer/TemperatureCelsius",
+        "/Twindexer/VelocityRPS",
+    ),
+    *[
+        _MechMotor(
+            "Drive Motors",
+            f"/Drive/Module{i}/DriveCurrentAmps",
+            f"/Drive/Module{i}/DriveAppliedVolts",
+            f"/Drive/Module{i}/DriveTemperatureCelsius",
+            f"/Drive/Module{i}/DriveVelocityRadPerSec",
+            vel_unit="rad/s",
+        )
+        for i in range(4)
+    ],
+    *[
+        _MechMotor(
+            "Steer Motors",
+            f"/Drive/Module{i}/TurnCurrentAmps",
+            f"/Drive/Module{i}/TurnAppliedVolts",
+            f"/Drive/Module{i}/TurnTemperatureCelsius",
+            f"/Drive/Module{i}/TurnVelocityRadPerSec",
+            vel_unit="rad/s",
+        )
+        for i in range(4)
+    ],
+]
+
+
+@dataclass
+class MechanismReport:
+    """Per-mechanism motor stats from a .wpilog file."""
+
+    name: str
+    current: ByMode
+    voltage: ByMode
+    temperature: ByMode
+    velocity: ByMode
+    vel_unit: str
+    energy_wh: float  # integrated |V×I| over all motors in this group
+
+    @property
+    def has_data(self) -> bool:
+        return bool(self.current.overall)
+
+
+def analyze_mechanisms(path: Path) -> list[MechanismReport]:
+    """Parse a .wpilog file and return per-mechanism motor statistics."""
+    mm, reader = _open_reader(path)
+    try:
+        tracker = ModeTracker()
+        entries: dict[int, StartRecordData] = {}
+
+        # Build ordered report list (one per unique report_name, order from _MOTORS)
+        report_order: list[str] = []
+        report_by_name: dict[str, MechanismReport] = {}
+        for motor in _MOTORS:
+            if motor.report_name not in report_by_name:
+                report_order.append(motor.report_name)
+                report_by_name[motor.report_name] = MechanismReport(
+                    name=motor.report_name,
+                    current=ByMode(),
+                    voltage=ByMode(),
+                    temperature=ByMode(),
+                    velocity=ByMode(),
+                    vel_unit=motor.vel_unit,
+                    energy_wh=0.0,
+                )
+
+        # key_path → (motor_idx, signal) — built once from _MOTORS
+        key_to_motor: dict[str, tuple[int, str]] = {}
+        for i, motor in enumerate(_MOTORS):
+            key_to_motor[motor.current_key] = (i, "current")
+            key_to_motor[motor.voltage_key] = (i, "voltage")
+            if motor.temp_key:
+                key_to_motor[motor.temp_key] = (i, "temp")
+            if motor.vel_key:
+                key_to_motor[motor.vel_key] = (i, "vel")
+
+        # Per-motor energy integration state
+        last_voltage = [0.0] * len(_MOTORS)
+        last_current_ts: list[int | None] = [None] * len(_MOTORS)
+        energy_ws = [0.0] * len(_MOTORS)
+
+        # entry_id → (motor_idx, signal) — populated from start records
+        eid_to_motor: dict[int, tuple[int, str]] = {}
+
+        for record in reader:
+            if record.is_start():
+                data = record.get_start_data()
+                entries[data.entry] = data
+                tracker.handle_start(data)
+                if data.name in key_to_motor:
+                    eid_to_motor[data.entry] = key_to_motor[data.name]
+            elif record.is_finish():
+                entry_id = record.get_finish_entry()
+                tracker.handle_finish(entry_id)
+                eid_to_motor.pop(entry_id, None)
+            elif not record.is_control():
+                if tracker.handle_data(record):
+                    continue
+                if record.entry not in eid_to_motor:
+                    continue
+                entry = entries.get(record.entry)
+                if not entry or entry.type != "double":
+                    continue
+
+                motor_idx, signal = eid_to_motor[record.entry]
+                motor = _MOTORS[motor_idx]
+                report = report_by_name[motor.report_name]
+                mode = tracker.mode
+                val = record.get_double()
+
+                if signal == "current":
+                    report.current.append(val, mode)
+                    ts = record.timestamp
+                    if last_current_ts[motor_idx] is not None:
+                        dt = (ts - last_current_ts[motor_idx]) / 1_000_000
+                        if 0 < dt <= _MECH_DT_MAX:
+                            energy_ws[motor_idx] += max(0.0, last_voltage[motor_idx] * val) * dt
+                    last_current_ts[motor_idx] = ts
+                elif signal == "voltage":
+                    report.voltage.append(val, mode)
+                    last_voltage[motor_idx] = val
+                elif signal == "temp":
+                    report.temperature.append(val, mode)
+                elif signal == "vel":
+                    report.velocity.append(val, mode)
+
+        # Sum per-motor watt-seconds into each report's energy_wh
+        for i, motor in enumerate(_MOTORS):
+            report_by_name[motor.report_name].energy_wh += energy_ws[i] / 3600.0
+
+    finally:
+        mm.close()
+
+    return [report_by_name[name] for name in report_order]
+
+
+# --- Brownout correlation analysis ---
+
+
+@dataclass
+class SignalCorrelation:
+    """Float samples split by brownout state."""
+
+    normal: list[float] = field(default_factory=list, repr=False)
+    brownout: list[float] = field(default_factory=list, repr=False)
+
+    def normal_stats(self) -> dict[str, float] | None:
+        return _compute_stats(self.normal)
+
+    def brownout_stats(self) -> dict[str, float] | None:
+        return _compute_stats(self.brownout)
+
+    def mean_delta_pct(self) -> float | None:
+        """Percent change in mean from normal to brownout. None if either bucket is empty."""
+        ns = self.normal_stats()
+        bs = self.brownout_stats()
+        if not ns or not bs or ns["mean"] == 0.0:
+            return None
+        return (bs["mean"] - ns["mean"]) / abs(ns["mean"]) * 100.0
+
+
+@dataclass
+class MechBrownoutStats:
+    """Per-mechanism motor signals split by brownout state."""
+
+    name: str
+    current: SignalCorrelation
+    voltage: SignalCorrelation
+    temperature: SignalCorrelation
+    velocity: SignalCorrelation
+    vel_unit: str
+
+    @property
+    def has_data(self) -> bool:
+        return bool(self.current.normal or self.current.brownout)
+
+    @property
+    def brownout_current_mean(self) -> float:
+        s = self.current.brownout_stats()
+        return s["mean"] if s else 0.0
+
+
+@dataclass
+class BrownoutCorrelationReport:
+    """Brownout correlation analysis from a .wpilog file."""
+
+    brownout_event_count: int
+    voltage: SignalCorrelation
+    total_current: SignalCorrelation
+    # (channel_index, correlation) sorted by brownout mean descending
+    channel_correlations: list[tuple[int, SignalCorrelation]]
+    mechanisms: list[MechBrownoutStats]  # sorted by brownout current mean desc
+
+    @property
+    def has_data(self) -> bool:
+        return bool(
+            self.voltage.normal
+            or self.voltage.brownout
+            or self.total_current.normal
+            or self.total_current.brownout
+            or any(m.has_data for m in self.mechanisms)
+        )
+
+
+def analyze_brownout_correlation(path: Path) -> BrownoutCorrelationReport:
+    """Parse a .wpilog file and correlate motor/mechanism signals against brownout state."""
+    mm, reader = _open_reader(path)
+    try:
+        tracker = ModeTracker()
+        entries: dict[int, StartRecordData] = {}
+
+        # Brownout state tracking
+        browned_out_id: int | None = None
+        is_browning = False
+        _prev_browning = False
+        brownout_event_count = 0
+
+        # PDH signal IDs
+        channel_current_id: int | None = None
+        total_current_id: int | None = None
+        voltage_id: int | None = None
+
+        # PDH signal correlations
+        voltage = SignalCorrelation()
+        reported_total = SignalCorrelation()
+        summed_total = SignalCorrelation()
+        channel_correlations: list[SignalCorrelation] = []
+        num_channels = 0
+
+        # Motor signal tracking (mirrors analyze_mechanisms)
+        key_to_motor: dict[str, tuple[int, str]] = {}
+        for i, motor in enumerate(_MOTORS):
+            key_to_motor[motor.current_key] = (i, "current")
+            key_to_motor[motor.voltage_key] = (i, "voltage")
+            if motor.temp_key:
+                key_to_motor[motor.temp_key] = (i, "temp")
+            if motor.vel_key:
+                key_to_motor[motor.vel_key] = (i, "vel")
+
+        report_order: list[str] = []
+        report_by_name: dict[str, MechBrownoutStats] = {}
+        for motor in _MOTORS:
+            if motor.report_name not in report_by_name:
+                report_order.append(motor.report_name)
+                report_by_name[motor.report_name] = MechBrownoutStats(
+                    name=motor.report_name,
+                    current=SignalCorrelation(),
+                    voltage=SignalCorrelation(),
+                    temperature=SignalCorrelation(),
+                    velocity=SignalCorrelation(),
+                    vel_unit=motor.vel_unit,
+                )
+
+        eid_to_motor: dict[int, tuple[int, str]] = {}
+
+        for record in reader:
+            if record.is_start():
+                data = record.get_start_data()
+                entries[data.entry] = data
+                tracker.handle_start(data)
+                if data.name == BROWNED_OUT_KEY:
+                    browned_out_id = data.entry
+                elif data.name == CHANNEL_CURRENT_KEY:
+                    channel_current_id = data.entry
+                elif data.name == TOTAL_CURRENT_KEY:
+                    total_current_id = data.entry
+                elif data.name == VOLTAGE_KEY:
+                    voltage_id = data.entry
+                elif data.name in key_to_motor:
+                    eid_to_motor[data.entry] = key_to_motor[data.name]
+
+            elif record.is_finish():
+                entry_id = record.get_finish_entry()
+                tracker.handle_finish(entry_id)
+                if entry_id == browned_out_id:
+                    browned_out_id = None
+                elif entry_id == channel_current_id:
+                    channel_current_id = None
+                elif entry_id == total_current_id:
+                    total_current_id = None
+                elif entry_id == voltage_id:
+                    voltage_id = None
+                eid_to_motor.pop(entry_id, None)
+
+            elif not record.is_control():
+                if tracker.handle_data(record):
+                    continue
+
+                if record.entry == browned_out_id:
+                    entry = entries.get(record.entry)
+                    if entry and entry.type == "boolean":
+                        is_browning = record.get_boolean()
+                        if is_browning and not _prev_browning:
+                            brownout_event_count += 1
+                        _prev_browning = is_browning
+                    continue
+
+                if record.entry == voltage_id:
+                    entry = entries.get(record.entry)
+                    if entry and entry.type == "double":
+                        v = record.get_double()
+                        if v != 0.0:
+                            if is_browning:
+                                voltage.brownout.append(v)
+                            else:
+                                voltage.normal.append(v)
+
+                elif record.entry == total_current_id:
+                    entry = entries.get(record.entry)
+                    if entry and entry.type == "double":
+                        amps = record.get_double()
+                        if is_browning:
+                            reported_total.brownout.append(amps)
+                        else:
+                            reported_total.normal.append(amps)
+
+                elif record.entry == channel_current_id:
+                    entry = entries.get(record.entry)
+                    if entry and entry.type == "double[]":
+                        currents = record.get_double_array()
+                        if not channel_correlations:
+                            num_channels = len(currents)
+                            channel_correlations = [SignalCorrelation() for _ in range(num_channels)]
+                        total = 0.0
+                        for i, amp in enumerate(currents):
+                            if i < num_channels:
+                                if is_browning:
+                                    channel_correlations[i].brownout.append(amp)
+                                else:
+                                    channel_correlations[i].normal.append(amp)
+                                total += amp
+                        if is_browning:
+                            summed_total.brownout.append(total)
+                        else:
+                            summed_total.normal.append(total)
+
+                elif record.entry in eid_to_motor:
+                    entry = entries.get(record.entry)
+                    if not entry or entry.type != "double":
+                        continue
+                    motor_idx, signal = eid_to_motor[record.entry]
+                    motor = _MOTORS[motor_idx]
+                    report = report_by_name[motor.report_name]
+                    val = record.get_double()
+                    if signal == "current":
+                        corr = report.current
+                    elif signal == "voltage":
+                        corr = report.voltage
+                    elif signal == "temp":
+                        corr = report.temperature
+                    else:
+                        corr = report.velocity
+                    if is_browning:
+                        corr.brownout.append(val)
+                    else:
+                        corr.normal.append(val)
+
+    finally:
+        mm.close()
+
+    # Prefer summed-from-channels total current; fall back to reported
+    total_current = (
+        summed_total
+        if (summed_total.normal or summed_total.brownout)
+        else reported_total
+    )
+
+    # Channel list: only channels with data, sorted by brownout mean descending
+    ch_list: list[tuple[int, SignalCorrelation]] = [
+        (i, corr)
+        for i, corr in enumerate(channel_correlations)
+        if corr.normal or corr.brownout
+    ]
+    ch_list.sort(
+        key=lambda x: (_compute_stats(x[1].brownout) or {}).get("mean", 0.0),
+        reverse=True,
+    )
+
+    # Mechanisms with any data, sorted by brownout current mean descending
+    mechanisms = [
+        report_by_name[name]
+        for name in report_order
+        if report_by_name[name].has_data
+    ]
+    mechanisms.sort(key=lambda m: m.brownout_current_mean, reverse=True)
+
+    return BrownoutCorrelationReport(
+        brownout_event_count=brownout_event_count,
+        voltage=voltage,
+        total_current=total_current,
+        channel_correlations=ch_list,
+        mechanisms=mechanisms,
+    )
 
 
 # --- File parsing ---
